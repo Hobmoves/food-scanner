@@ -23,10 +23,21 @@ async function main() {
     }
     const product = off.product;
     const analysis = analyzeProduct(product);
-    render(product, code, analysis);
-    // Recalls are fetched after the main render so the page is usable
-    // immediately — recall lookup is a slower, best-effort secondary call.
+    const nutrition = mergeNutrition(product.nutriments || {}, null); // USDA fills in async below
+    render(product, code, analysis, nutrition);
+
+    // Everything below is a slower, best-effort secondary call — the page
+    // is already usable with just Open Food Facts data by this point.
     fetchRecalls(product.brands).then(renderRecalls).catch(() => renderRecalls([]));
+
+    if (USDA_API_KEY) {
+      fetchUSDA(code).then((usda) => {
+        const merged = mergeNutrition(product.nutriments || {}, usda);
+        if (merged.usedUsda) renderNutrition(merged);
+      }).catch(() => {});
+    }
+
+    fetchSwaps(product, code).then(renderSwaps).catch(() => renderSwaps([]));
   } catch (err) {
     showError(err);
   }
@@ -53,6 +64,99 @@ async function fetchRecalls(brands) {
     if (!res.ok) return [];
     const data = await res.json();
     return data.results || [];
+  } catch {
+    return [];
+  }
+}
+
+// Standard USDA nutrient numbers (stable across their datasets, unlike the
+// internal numeric nutrientId). Sodium is converted to salt (g) to match
+// Open Food Facts' units: salt = sodium(mg) * 2.5 / 1000.
+const USDA_NUTRIENT_NUMBERS = {
+  energy: "208", fat: "204", satFat: "606", carbs: "205",
+  sugars: "269", fiber: "291", protein: "203", sodium: "307"
+};
+
+// USDA's Branded Foods dataset carries real gtinUpc values, but barcode
+// digit-count/leading-zero conventions differ between UPC-A and EAN-13, so
+// results are normalized (leading zeros stripped) before matching rather
+// than trusting the first search hit — a mismatch here would show the wrong
+// product's nutrition data, which is worse than showing none.
+async function fetchUSDA(barcode) {
+  if (!USDA_API_KEY) return null;
+  const normalize = (s) => String(s || "").replace(/^0+/, "");
+  try {
+    const res = await fetch(`https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${encodeURIComponent(USDA_API_KEY)}&query=${encodeURIComponent(barcode)}&dataType=Branded&pageSize=5`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const match = (data.foods || []).find((f) => normalize(f.gtinUpc) === normalize(barcode));
+    if (!match) return null;
+
+    const byNumber = {};
+    for (const n of match.foodNutrients || []) {
+      byNumber[n.nutrientNumber] = n.value;
+    }
+    const out = {};
+    for (const [key, num] of Object.entries(USDA_NUTRIENT_NUMBERS)) {
+      if (byNumber[num] !== undefined) out[key] = byNumber[num];
+    }
+    if (out.sodium !== undefined) {
+      out.salt = Math.round((out.sodium * 2.5 / 1000) * 10) / 10;
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+// Prefer Open Food Facts (usually mirrors the actual product label
+// directly). Only backfill from USDA when OFF's field is missing/empty —
+// and tag which rows came from USDA so the source stays transparent.
+function mergeNutrition(offNutriments, usda) {
+  const fields = [
+    ["energy", "energy-kcal_100g", "kcal"],
+    ["fat", "fat_100g", "g"],
+    ["satFat", "saturated-fat_100g", "g"],
+    ["carbs", "carbohydrates_100g", "g"],
+    ["sugars", "sugars_100g", "g"],
+    ["fiber", "fiber_100g", "g"],
+    ["protein", "proteins_100g", "g"],
+    ["salt", "salt_100g", "g"]
+  ];
+  const round1 = (v) => Math.round(v * 10) / 10;
+  let usedUsda = false;
+  const rows = fields.map(([key, offKey, unit]) => {
+    const offVal = offNutriments[offKey];
+    if (offVal !== undefined && offVal !== null && offVal !== "") {
+      return { key, value: round1(offVal), unit, source: "off" };
+    }
+    if (usda && usda[key] !== undefined) {
+      usedUsda = true;
+      return { key, value: round1(usda[key]), unit, source: "usda" };
+    }
+    return { key, value: null, unit, source: null };
+  });
+  return { rows, usedUsda };
+}
+
+// Swap suggestions only make sense when Open Food Facts has a category to
+// search within, and only when the scanned product isn't already top-tier —
+// showing "better options" next to an A-rated product is just noise.
+async function fetchSwaps(product, currentCode) {
+  const grade = product.nutriscore_grade;
+  if (grade === "a") return [];
+  const tags = product.categories_tags || [];
+  const category = tags[tags.length - 1];
+  if (!category) return [];
+
+  try {
+    const url = `https://world.openfoodfacts.org/api/v2/search?categories_tags=${encodeURIComponent(category)}&nutrition_grades_tags=a,b&fields=code,product_name,brands,nutriscore_grade,image_small_url&page_size=8&sort_by=nutriscore_score`;
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.products || [])
+      .filter((p) => p.code !== currentCode && p.product_name)
+      .slice(0, 3);
   } catch {
     return [];
   }
@@ -123,7 +227,7 @@ function ringHTML(label, ring, detail) {
     </details>`;
 }
 
-function render(product, barcode, analysis) {
+function render(product, barcode, analysis, nutrition) {
   const name = product.product_name || "Unknown product";
   const brands = product.brands || "";
   const quantity = product.quantity || "";
@@ -187,11 +291,12 @@ function render(product, barcode, analysis) {
         </div>
         <div class="section-title">Flagged Ingredients</div>
         <div class="info-card"><div class="chips">${hitsHTML}</div></div>
+        <div id="swaps-section"></div>
       </div>
 
       <div class="panel panel-nutrition">
         <div class="section-title">Per 100g</div>
-        <div class="nutri-card">${nutritionRows(product.nutriments || {})}</div>
+        <div class="nutri-card" id="nutri-card">${nutritionRowsHTML(nutrition.rows)}</div>
       </div>
 
       <div class="panel panel-ingredients">
@@ -208,7 +313,7 @@ function render(product, barcode, analysis) {
       </div>
     </div>
 
-    <div class="footer">Data via Open Food Facts &amp; FDA openFDA<br>Not medical advice</div>
+    <div class="footer">Data via Open Food Facts, FDA openFDA &amp; USDA FoodData Central<br>Not medical advice</div>
   `;
 }
 
@@ -230,20 +335,39 @@ function renderRecalls(results) {
     </details>`).join("");
 }
 
-function nutritionRows(n) {
-  const round1 = (v) => (v === undefined || v === null || v === "") ? "-" : Math.round(v * 10) / 10;
-  const rows = [
-    ["Energy", round1(n["energy-kcal_100g"]), "kcal"],
-    ["Fat", round1(n["fat_100g"]), "g"],
-    ["Sat. Fat", round1(n["saturated-fat_100g"]), "g"],
-    ["Carbs", round1(n["carbohydrates_100g"]), "g"],
-    ["Sugars", round1(n["sugars_100g"]), "g"],
-    ["Fiber", round1(n["fiber_100g"]), "g"],
-    ["Protein", round1(n["proteins_100g"]), "g"],
-    ["Salt", round1(n["salt_100g"]), "g"]
-  ];
-  return rows.map(([k, v, unit]) => `
-    <div class="nutri-row"><span class="k">${k}</span><span class="v">${v}${v === "-" ? "" : " " + unit}</span></div>
+function renderSwaps(swaps) {
+  const section = $("#swaps-section");
+  if (!section) return;
+  if (!swaps.length) {
+    section.innerHTML = "";
+    return;
+  }
+  section.innerHTML = `
+    <div class="section-title">Better Options Nearby</div>
+    <div class="swap-row">
+      ${swaps.map((p) => `
+        <a class="swap-card" href="?code=${encodeURIComponent(p.code)}">
+          <div class="swap-art">${p.image_small_url ? `<img src="${p.image_small_url}" onerror="this.style.display='none'">` : ""}</div>
+          <div class="swap-grade" style="background:${scoreRing(p.nutriscore_grade).color}">${scoreRing(p.nutriscore_grade).display}</div>
+          <div class="swap-name">${escapeHtml(p.product_name)}</div>
+        </a>
+      `).join("")}
+    </div>`;
+}
+
+function renderNutrition(nutrition) {
+  const card = $("#nutri-card");
+  if (!card) return;
+  card.innerHTML = nutritionRowsHTML(nutrition.rows);
+}
+
+function nutritionRowsHTML(rows) {
+  const labels = { energy: "Energy", fat: "Fat", satFat: "Sat. Fat", carbs: "Carbs", sugars: "Sugars", fiber: "Fiber", protein: "Protein", salt: "Salt" };
+  return rows.map((r) => `
+    <div class="nutri-row">
+      <span class="k">${labels[r.key]}</span>
+      <span class="v">${r.value === null ? "-" : r.value + " " + r.unit}${r.source === "usda" ? ' <span class="usda-tag">USDA</span>' : ""}</span>
+    </div>
   `).join("");
 }
 
