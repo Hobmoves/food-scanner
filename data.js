@@ -62,6 +62,17 @@ const SEED_OILS = [
   "vegetable oil", "peanut oil"
 ];
 
+// Matched case-insensitively as substrings against each candidate's
+// stores_tags entries. That field is crowdsourced and noisy (sometimes
+// contains manufacturer address fragments instead of real store names —
+// confirmed via testing), but a real retailer name, when present, matches
+// cleanly as a substring regardless of that surrounding noise.
+const BIG_STORES = [
+  "Costco", "Whole Foods", "Target", "Walmart", "Kroger", "Trader Joe",
+  "Safeway", "Publix", "Albertsons", "Sam's Club", "Aldi", "Sprouts",
+  "Wegmans", "H-E-B", "Meijer"
+];
+
 if (typeof module !== "undefined") {
-  module.exports = { ADDITIVES, SEED_OILS };
+  module.exports = { ADDITIVES, SEED_OILS, BIG_STORES };
 }

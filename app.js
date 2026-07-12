@@ -37,7 +37,10 @@ async function main() {
       }).catch(() => {});
     }
 
-    fetchSwaps(product, code).then(renderSwaps).catch(() => renderSwaps({ status: "error", items: [] }));
+    if (swapsApplicable(product)) {
+      renderSwapsLoading();
+      fetchSwaps(product, code).then(renderSwaps).catch(() => renderSwaps({ status: "error", items: [] }));
+    }
   } catch (err) {
     showError(err);
   }
@@ -141,6 +144,17 @@ function mergeNutrition(offNutriments, usda) {
 
 const GRADE_RANK = { a: 0, b: 1, c: 2, d: 3, e: 4 };
 
+// Most-specific VALID English category tag — not just the last array entry,
+// which can be a mislabeled non-English duplicate (confirmed via testing).
+function bestCategoryTag(product) {
+  const tags = product.categories_tags || [];
+  return [...tags].reverse().find((t) => /^en:[a-z0-9-]+$/.test(t)) || null;
+}
+
+function swapsApplicable(product) {
+  return product.nutriscore_grade !== "a" && !!bestCategoryTag(product);
+}
+
 // Swap suggestions only make sense when Open Food Facts has a category to
 // search within, and only when the scanned product isn't already top-tier —
 // showing "better options" next to an A-rated product is just noise.
@@ -159,24 +173,35 @@ const GRADE_RANK = { a: 0, b: 1, c: 2, d: 3, e: 4 };
 // than /product/ (confirmed via testing), and silently showing nothing
 // either way makes a working feature look broken/nonexistent.
 async function fetchSwaps(product, currentCode) {
-  const grade = product.nutriscore_grade;
-  if (grade === "a") return { status: "not-applicable", items: [] };
-  const currentRank = GRADE_RANK[grade] ?? 5;
-
-  // Most-specific VALID English category tag — not just the last array
-  // entry, which can be a mislabeled non-English duplicate.
-  const tags = product.categories_tags || [];
-  const category = [...tags].reverse().find((t) => /^en:[a-z0-9-]+$/.test(t));
-  if (!category) return { status: "not-applicable", items: [] };
+  if (!swapsApplicable(product)) return { status: "not-applicable", items: [] };
+  const currentRank = GRADE_RANK[product.nutriscore_grade] ?? 5;
+  const category = bestCategoryTag(product);
 
   try {
-    const url = `https://world.openfoodfacts.org/api/v2/search?categories_tags=${encodeURIComponent(category)}&fields=code,product_name,brands,nutriscore_grade,image_small_url&page_size=20&sort_by=nutriscore_score`;
+    const url = `https://world.openfoodfacts.org/api/v2/search?categories_tags=${encodeURIComponent(category)}&fields=code,product_name,brands,nutriscore_grade,image_small_url,stores_tags,unique_scans_n&page_size=20&sort_by=nutriscore_score`;
     const res = await fetch(url);
     if (!res.ok) return { status: "error", items: [] };
     const data = await res.json();
+
     const items = (data.products || [])
       .filter((p) => p.code !== currentCode && p.product_name && (GRADE_RANK[p.nutriscore_grade] ?? 5) < currentRank)
+      .map((p) => {
+        const storesText = (p.stores_tags || []).join(" ");
+        const matchedStore = BIG_STORES.find((s) => storesText.toLowerCase().includes(s.toLowerCase())) || null;
+        return { ...p, matchedStore, scans: p.unique_scans_n || 0 };
+      })
+      // Better grade first (already filtered to strictly-better), then
+      // prefer ones confirmed sold at a major retailer, then by scan
+      // count as a popularity proxy.
+      .sort((a, b) => {
+        const gradeDiff = (GRADE_RANK[a.nutriscore_grade] ?? 5) - (GRADE_RANK[b.nutriscore_grade] ?? 5);
+        if (gradeDiff !== 0) return gradeDiff;
+        const storeDiff = (b.matchedStore ? 1 : 0) - (a.matchedStore ? 1 : 0);
+        if (storeDiff !== 0) return storeDiff;
+        return b.scans - a.scans;
+      })
       .slice(0, 3);
+
     return { status: "ok", items };
   } catch {
     return { status: "error", items: [] };
@@ -376,15 +401,41 @@ function renderSwaps({ status, items }) {
       <div class="swap-note">No better-rated alternatives found in this category.</div>`;
     return;
   }
+  const maxScans = Math.max(...items.map((p) => p.scans));
   section.innerHTML = `
     <div class="section-title">Better Options Nearby</div>
-    <div class="swap-row">
+    <div class="swap-list">
       ${items.map((p) => `
-        <a class="swap-card" href="?code=${encodeURIComponent(p.code)}">
-          <div class="swap-art">${p.image_small_url ? `<img src="${p.image_small_url}" onerror="this.style.display='none'">` : ""}</div>
+        <a class="swap-item" href="?code=${encodeURIComponent(p.code)}">
+          <div class="swap-thumb">${p.image_small_url ? `<img src="${p.image_small_url}" onerror="this.style.display='none'">` : ""}</div>
+          <div class="swap-body">
+            <div class="swap-title">${escapeHtml(p.product_name)}</div>
+            ${p.brands ? `<div class="swap-brand">${escapeHtml(p.brands.split(",")[0].trim())}</div>` : ""}
+            <div class="swap-badges">
+              ${p.matchedStore ? `<span class="swap-badge store">${escapeHtml(p.matchedStore)}</span>` : ""}
+              ${p.scans > 0 && p.scans === maxScans ? `<span class="swap-badge popular">Popular</span>` : ""}
+            </div>
+          </div>
           <div class="swap-grade" style="background:${scoreRing(p.nutriscore_grade).color}">${scoreRing(p.nutriscore_grade).display}</div>
-          <div class="swap-name">${escapeHtml(p.product_name)}</div>
         </a>
+      `).join("")}
+    </div>`;
+}
+
+function renderSwapsLoading() {
+  const section = $("#swaps-section");
+  if (!section) return;
+  section.innerHTML = `
+    <div class="section-title">Better Options Nearby</div>
+    <div class="swap-list">
+      ${[0, 1, 2].map(() => `
+        <div class="swap-item swap-skeleton">
+          <div class="swap-thumb shimmer"></div>
+          <div class="swap-body">
+            <div class="skeleton-line shimmer" style="width:70%"></div>
+            <div class="skeleton-line shimmer" style="width:40%"></div>
+          </div>
+        </div>
       `).join("")}
     </div>`;
 }
