@@ -11,15 +11,16 @@ to the "Food Scanner" iOS Shortcut, which scans a barcode and opens
 - Best-effort recall search against the FDA's [openFDA Food Enforcement API](https://open.fda.gov/apis/food/enforcement/), matched by brand name (no barcode index exists in that dataset, so this is a name match, not a guarantee)
 - Renders Nutri-Score / Nova / Eco-Score as tappable info rings, nutrition facts, and full ingredients
 
-## Local dev
-
-```
-node server.js
-```
-
-Serves on `http://localhost:5185`. Visit `/?code=<any barcode>` to test.
-
 ## Deployment
 
-Static site, no build step — deployed via GitHub Pages with a custom domain
-(`CNAME` file points at `food.holben.net`).
+Pure static site (`index.html` + `style.css` + `app.js` + `data.js`), no build
+step, no server — deployed via GitHub Pages with a custom domain (`CNAME`
+file points at `food.holben.net`). Unlike `holben-net`, this runs entirely on
+GitHub's infrastructure and stays up regardless of whether any local machine
+is on.
+
+## Local dev
+
+Any static file server works, e.g. `npx serve .` or VS Code's Live Server —
+nothing in this repo requires Node at runtime. Visit `/?code=<any barcode>`
+to test.
