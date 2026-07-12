@@ -139,23 +139,37 @@ function mergeNutrition(offNutriments, usda) {
   return { rows, usedUsda };
 }
 
+const GRADE_RANK = { a: 0, b: 1, c: 2, d: 3, e: 4 };
+
 // Swap suggestions only make sense when Open Food Facts has a category to
 // search within, and only when the scanned product isn't already top-tier —
 // showing "better options" next to an A-rated product is just noise.
+//
+// The grade filter is deliberately NOT sent as a query param — OFF's
+// categories_tags field mixes valid English tags with mislabeled French
+// ones (confirmed via testing, e.g. Nutella's last tag is "en:Pâtes à
+// tartiner"), and the exact filterable field name/syntax for grade
+// combined with a category filter couldn't be confirmed against live
+// docs. Category-only search is verified reliable, so grade comparison
+// happens client-side instead on the fields already returned.
 async function fetchSwaps(product, currentCode) {
   const grade = product.nutriscore_grade;
   if (grade === "a") return [];
+  const currentRank = GRADE_RANK[grade] ?? 5;
+
+  // Most-specific VALID English category tag — not just the last array
+  // entry, which can be a mislabeled non-English duplicate.
   const tags = product.categories_tags || [];
-  const category = tags[tags.length - 1];
+  const category = [...tags].reverse().find((t) => /^en:[a-z0-9-]+$/.test(t));
   if (!category) return [];
 
   try {
-    const url = `https://world.openfoodfacts.org/api/v2/search?categories_tags=${encodeURIComponent(category)}&nutrition_grades_tags=a,b&fields=code,product_name,brands,nutriscore_grade,image_small_url&page_size=8&sort_by=nutriscore_score`;
+    const url = `https://world.openfoodfacts.org/api/v2/search?categories_tags=${encodeURIComponent(category)}&fields=code,product_name,brands,nutriscore_grade,image_small_url&page_size=20&sort_by=nutriscore_score`;
     const res = await fetch(url);
     if (!res.ok) return [];
     const data = await res.json();
     return (data.products || [])
-      .filter((p) => p.code !== currentCode && p.product_name)
+      .filter((p) => p.code !== currentCode && p.product_name && (GRADE_RANK[p.nutriscore_grade] ?? 5) < currentRank)
       .slice(0, 3);
   } catch {
     return [];
