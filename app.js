@@ -37,7 +37,7 @@ async function main() {
       }).catch(() => {});
     }
 
-    fetchSwaps(product, code).then(renderSwaps).catch(() => renderSwaps([]));
+    fetchSwaps(product, code).then(renderSwaps).catch(() => renderSwaps({ status: "error", items: [] }));
   } catch (err) {
     showError(err);
   }
@@ -152,27 +152,34 @@ const GRADE_RANK = { a: 0, b: 1, c: 2, d: 3, e: 4 };
 // combined with a category filter couldn't be confirmed against live
 // docs. Category-only search is verified reliable, so grade comparison
 // happens client-side instead on the fields already returned.
+//
+// Returns a status alongside the items so the UI can tell "genuinely no
+// better alternatives" apart from "the request failed/got rate-limited" —
+// OFF's /search endpoint throttles anonymous requests more aggressively
+// than /product/ (confirmed via testing), and silently showing nothing
+// either way makes a working feature look broken/nonexistent.
 async function fetchSwaps(product, currentCode) {
   const grade = product.nutriscore_grade;
-  if (grade === "a") return [];
+  if (grade === "a") return { status: "not-applicable", items: [] };
   const currentRank = GRADE_RANK[grade] ?? 5;
 
   // Most-specific VALID English category tag — not just the last array
   // entry, which can be a mislabeled non-English duplicate.
   const tags = product.categories_tags || [];
   const category = [...tags].reverse().find((t) => /^en:[a-z0-9-]+$/.test(t));
-  if (!category) return [];
+  if (!category) return { status: "not-applicable", items: [] };
 
   try {
     const url = `https://world.openfoodfacts.org/api/v2/search?categories_tags=${encodeURIComponent(category)}&fields=code,product_name,brands,nutriscore_grade,image_small_url&page_size=20&sort_by=nutriscore_score`;
     const res = await fetch(url);
-    if (!res.ok) return [];
+    if (!res.ok) return { status: "error", items: [] };
     const data = await res.json();
-    return (data.products || [])
+    const items = (data.products || [])
       .filter((p) => p.code !== currentCode && p.product_name && (GRADE_RANK[p.nutriscore_grade] ?? 5) < currentRank)
       .slice(0, 3);
+    return { status: "ok", items };
   } catch {
-    return [];
+    return { status: "error", items: [] };
   }
 }
 
@@ -349,17 +356,30 @@ function renderRecalls(results) {
     </details>`).join("");
 }
 
-function renderSwaps(swaps) {
+function renderSwaps({ status, items }) {
   const section = $("#swaps-section");
   if (!section) return;
-  if (!swaps.length) {
+
+  if (status === "not-applicable") {
     section.innerHTML = "";
+    return;
+  }
+  if (status === "error") {
+    section.innerHTML = `
+      <div class="section-title">Better Options Nearby</div>
+      <div class="swap-note">Couldn't check for alternatives right now — try again shortly.</div>`;
+    return;
+  }
+  if (!items.length) {
+    section.innerHTML = `
+      <div class="section-title">Better Options Nearby</div>
+      <div class="swap-note">No better-rated alternatives found in this category.</div>`;
     return;
   }
   section.innerHTML = `
     <div class="section-title">Better Options Nearby</div>
     <div class="swap-row">
-      ${swaps.map((p) => `
+      ${items.map((p) => `
         <a class="swap-card" href="?code=${encodeURIComponent(p.code)}">
           <div class="swap-art">${p.image_small_url ? `<img src="${p.image_small_url}" onerror="this.style.display='none'">` : ""}</div>
           <div class="swap-grade" style="background:${scoreRing(p.nutriscore_grade).color}">${scoreRing(p.nutriscore_grade).display}</div>
